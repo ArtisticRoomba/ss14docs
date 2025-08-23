@@ -68,6 +68,11 @@ This is determined by $2 \cdot \text{atmos.delta_pressure_parallel_batch_size}$.
 So if your `atmos.delta_pressure_parallel_batch_size` was 100, you would need at minimum 200 entities requiring processing for `ParallelRobustJob` to run the job in parallel.
 
 #### Configuration
+```admonish warning
+The default configuration values for Parallel Solve are good values that have been determined through ~16 hours of benchmarking.
+Choosing the wrong values can reduce performance to single-threaded equivelants.
+```
+
 A certain number of entities are processed per `ProcessDeltaPressure` iteration as defined by the `atmos.delta_pressure_parallel_process_per_iteration` CVAR.
 The number of entities processed per job is also configurable by the `atmos.delta_pressure_parallel_batch_size` CVAR.
 
@@ -378,13 +383,7 @@ a4[n...]
 end
 ```
 
-## Future Performance Improvements
-Right now, the time complexity for DeltaPressure is $O(n)$ where $n = \text{number of entities}$.
-Parallel solve and SIMD certainly help, but the sheer time is spent processing a lot of entities.
-
-There are two non-vectorized calculations occuring during the main run which take up some time.
-The first one is actually retrieving the `GasMixture`'s pressure, as we have to call a `get` method:
-
+SIMD is also used to accelerate the scalar calculation that is preformed when calling the `get` method in GasMixture for retrieving pressure:
 ```csharp
 [ViewVariables]
 public float Pressure
@@ -397,10 +396,11 @@ public float Pressure
 }
 ```
 
-This could be vectorized via having a bulk `GasMixture` retrieval helper method that retrieved an array of `GasMixture`s, using methods in `NumericsHelpers` to calculate pressure, as all other values are values that we can simply read.
-This is a hypothetical though—a volume of zero might prove to be problematic, however we could `Debug.Assert` that it is not zero as Delta-Pressure is explicitly calculating `GasMixture`s that belong to a `TileAtmosphere`, which will never have a zero volume.
+## Future Performance Improvements
+Right now, the time complexity for DeltaPressure is $O(n)$ where $n = \text{number of entities}$.
+Parallel solve and SIMD certainly help, but the sheer time is spent processing a lot of entities.
 
-The second calculation is this absolutely naive loop I wrote in 2 seconds:
+There is one major scalar calculation, which is this absolutely naive loop I wrote in 2 seconds:
 ```csharp
 var maxPressure = 0f;
 var maxDelta = 0f;
@@ -420,7 +420,25 @@ Replacing this with a vector operation would require me to:
 
 This loop might also be JIT optimized to begin with.
 
-#### Wider Scope
+### SIMD Batch Processing Improvements
+While the current implementation does use SIMD to accelerate calculations, the implementation is flawed and requires rewriting (hey, it works for now, but other maintainers want me to actually merge it instead of working on it forever).
+
+Helper methods in `NumericsHelpers` are fairly robust - they first take advantage of [AVX-512](https://en.wikipedia.org/wiki/AVX-512) when available, which allows us to compute 16 vectors at the same time.
+If not available, they will fall back to 256 bit and 128 bit vectors.
+
+Right now, we're only computing two vectors per call for pressure differential calculations, which is horrible, compared to how much we could be doing.
+Similarly, we only compute 4 `GasMixture` pressures at the same time.
+
+Any sort of future implementation could read from the array in bulk, processing correctly sized pieces at a time:
+- Retrieve the first $16 \cdot \text{DeltaPressurePairCount}$ entities (32 right now)
+- Retrieve the pressures from each entity (4 pressure elements per entity, so 128 for the array, which is divisible by 16)
+- Load into spans and calculate delta pressure information
+
+This is easy to do single threaded, however implementing parallel solve would require interesting tricks, as `ParallelRobustJob` generally expects you to be processing a single element of a list per iteration.
+
+One way you could do it is to load (but not process) elements into a 32 element list and process them when you hit the limit-however you're still stuck with figuring out when you're at the end of the list (how do you handle remainders?).
+
+### Wider Scope
 Any type of major performance improvement has to reduce the number of entities that are actually processed.
 This is actually a very similar case to the optimization/refactoring efforts that happened to `AirtightData`—this data is now cached and updated when invalidated by anything that invalidates it, instead of recomputing airtight data for each entity.
 This is easier said than done though.
